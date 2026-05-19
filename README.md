@@ -10,6 +10,10 @@ Official implementation of the paper **"CompactAttention: Accelerating Chunked P
   <img src="assets/pareto.png">
 </p>
 
+<p align="center">
+  <img src="assets/method.png">
+</p>
+
 **CompactAttention** is a sparse-attention method designed for **chunked prefill** serving of long-context LLMs. It reframes 2D block-sparse masks as **KV-selection signals** and gathers a per-group KV block table so a dense FlashAttention kernel can do the work — recovering dense-kernel throughput while keeping full-attention accuracy.
 
 🚀 Key Features
@@ -31,10 +35,6 @@ Official implementation of the paper **"CompactAttention: Accelerating Chunked P
   On LLaMA-3.1-8B-Instruct at 128K context, matches dense-attention accuracy on RULER while delivering up to **2.72×** attention speedup.
 
 ### Key Results
-
-<p align="center">
-  <img src="assets/method.png">
-</p>
 
 <p align="center">
   <img src="assets/speedup.png">
