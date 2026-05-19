@@ -2,9 +2,13 @@
 
 Official implementation of the paper **"CompactAttention: Accelerating Chunked Prefill with Block-Union KV Selection"**
 
-[![arXiv](https://img.shields.io/badge/arXiv-2605.16839-b31b1b.svg)](https://arxiv.org/abs/2605.16839)
+<p align="center">
+  <a href="https://arxiv.org/abs/2605.16839"><img src="https://img.shields.io/badge/arXiv-2605.16839-b31b1b.svg" alt="arXiv"></a>
+</p>
 
-![](assets/pareto.png)
+<p align="center">
+  <img src="assets/pareto.png">
+</p>
 
 **CompactAttention** is a sparse-attention method designed for **chunked prefill** serving of long-context LLMs. It reframes 2D block-sparse masks as **KV-selection signals** and gathers a per-group KV block table so a dense FlashAttention kernel can do the work — recovering dense-kernel throughput while keeping full-attention accuracy.
 
@@ -28,11 +32,17 @@ Official implementation of the paper **"CompactAttention: Accelerating Chunked P
 
 ### Key Results
 
-![](assets/method.png)
+<p align="center">
+  <img src="assets/method.png">
+</p>
 
-![](assets/speedup.png)
+<p align="center">
+  <img src="assets/speedup.png">
+</p>
 
-![](assets/accuracy.png)
+<p align="center">
+  <img src="assets/accuracy.png">
+</p>
 
 Usage
 -----
