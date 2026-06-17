@@ -1,0 +1,1236 @@
+# coding=utf-8
+# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Modified by Yizhao Gao from huggingface llama implementation
+
+from typing import Callable, List, Optional, Tuple, Union
+
+import torch
+import torch.utils.checkpoint
+from torch import nn
+import torch.nn.functional as F
+
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from transformers.generation import GenerationMixin
+from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+from transformers.modeling_utils import PreTrainedModel
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
+from transformers.utils import (
+    add_code_sample_docstrings,
+    add_start_docstrings,
+    add_start_docstrings_to_model_forward,
+    logging,
+    replace_return_docstrings,
+)
+from compact_attn.prefill_sparse.llama.configuration_llama_seerattn import SeerAttnLlamaConfig
+from compact_attn.utils import BaseModelOutputWithPastAndSeer, CausalLMOutputWithPastAndSeer
+from compact_attn.prefill_sparse.attn_gate import ATTNGATE_CLASSES, MultiHeadLinear
+from compact_attn.modules.common import (
+    repeat_kv,
+    apply_rotary_pos_emb,
+    get_sparse_attn_mask_from_nz_ratio,
+    get_sparse_attn_mask_from_threshold
+)
+from compact_attn.modules.dense_prefill import dense_prefill_full_kv
+from einops import rearrange
+
+from compact_attn.modules.attention_distill import attention_distill_forward
+from compact_attn.modules.attention_forward import sparse_flash_attention_forward
+import copy, math, os
+from huggingface_hub import hf_hub_download
+from flash_attn.layers.rotary import apply_rotary_emb_func
+from compact_attn.modules.layernorm import RMSNorm
+
+
+logger = logging.get_logger(__name__)
+
+
+def _has_unsupported_seer_batch_metadata(
+    seer_batch_kv_lens: Optional[torch.Tensor],
+    seer_batch_query_lens: Optional[torch.Tensor],
+    seer_batch_query_start: Optional[torch.Tensor],
+) -> bool:
+    return (
+        seer_batch_kv_lens is not None
+        or seer_batch_query_lens is not None
+        or seer_batch_query_start is not None
+    )
+
+
+def _raise_unsupported_seer_batch_metadata(
+    *,
+    seer_batch_kv_lens: Optional[torch.Tensor],
+    seer_batch_query_lens: Optional[torch.Tensor],
+    seer_batch_query_start: Optional[torch.Tensor],
+    context: str,
+) -> None:
+    if not _has_unsupported_seer_batch_metadata(
+        seer_batch_kv_lens,
+        seer_batch_query_lens,
+        seer_batch_query_start,
+    ):
+        return
+    raise ValueError(
+        f"{context} no longer supports mixed-length batch metadata. "
+        "Use exact same-length batches and do not pass "
+        "`seer_batch_kv_lens`, `seer_batch_query_lens`, or `seer_batch_query_start`."
+    )
+
+
+def _cuda_elapsed_ms(fn, enabled: bool = True):
+    if not enabled:
+        return fn(), 0.0
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    out = fn()
+    end.record()
+    end.synchronize()
+    return out, float(start.elapsed_time(end))
+
+
+SEER_LLAMA_CAUSALLM_TP_PLAN = {
+    "model.layers.*.self_attn.q_proj": "colwise",
+    "model.layers.*.self_attn.k_proj": "colwise",
+    "model.layers.*.self_attn.v_proj": "colwise",
+    "model.layers.*.self_attn.o_proj": "rowwise",
+    "model.layers.*.mlp.gate_proj": "colwise",
+    "model.layers.*.mlp.up_proj": "colwise",
+    "model.layers.*.mlp.down_proj": "rowwise",
+    "lm_head": "colwise_rep",
+}
+
+
+class LlamaRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        LlamaRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+ALL_LAYERNORM_LAYERS.append(LlamaRMSNorm)
+
+
+class LlamaRotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        config: SeerAttnLlamaConfig,
+        device=None,
+    ):
+        super().__init__()
+        self.rope_kwargs = {}
+        # BC: "rope_type" was originally "type"
+        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+        else:
+            self.rope_type = "default"
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, **self.rope_kwargs)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    def _dynamic_frequency_update(self, position_ids, device):
+        """
+        dynamic RoPE layers should recompute `inv_freq` in the following situations:
+        1 - growing beyond the cached sequence length (allow scaling)
+        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
+        """
+        seq_len = torch.max(position_ids) + 1
+        if seq_len > self.max_seq_len_cached:  # growth
+            inv_freq, self.attention_scaling = self.rope_init_fn(
+                self.config, device, seq_len=seq_len, **self.rope_kwargs
+            )
+            self.register_buffer("inv_freq", inv_freq, persistent=False)  # TODO joao: may break with compilation
+            self.max_seq_len_cached = seq_len
+
+        if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:  # reset
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+            self.max_seq_len_cached = self.original_max_seq_len
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            self._dynamic_frequency_update(position_ids, device=x.device)
+
+        # Core RoPE block
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            if self.config.use_flash_rope:
+                emb = freqs  # FlashAttention rotary expects 2D cos/sin.
+                cos = emb.cos()
+                sin = emb.sin()
+                if cos.shape[0] == 1:
+                    cos = cos[0]
+                    sin = sin[0]
+                else:
+                    ref_position_ids = position_ids[:1]
+                    if torch.equal(position_ids, ref_position_ids.expand_as(position_ids)):
+                        cos = cos[0]
+                        sin = sin[0]
+                    else:
+                        # Fall back to the standard per-batch rotary path for
+                        # heterogeneous multi-batch position ids.
+                        emb = torch.cat((freqs, freqs), dim=-1)
+                        cos = emb.cos()
+                        sin = emb.sin()
+            else:
+                emb = torch.cat((freqs, freqs), dim=-1)
+                cos = emb.cos()
+                sin = emb.sin()
+
+        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+def _build_position_ids_from_attention_mask(
+    attention_mask: Optional[torch.Tensor],
+    cache_position: torch.LongTensor,
+    query_length: int,
+) -> torch.LongTensor:
+    if attention_mask is None:
+        return cache_position.unsqueeze(0)
+
+    position_ids = attention_mask.to(torch.long).cumsum(-1) - 1
+    position_ids.masked_fill_(attention_mask == 0, 0)
+    return position_ids[:, -query_length:]
+
+
+class LlamaMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+
+
+class LlamaSeerAttention(nn.Module):
+    """SeerAttention: Learning Sparse Attention for Transformers"""
+
+    def __init__(self, config: SeerAttnLlamaConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = True
+
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        )
+
+        self.attn_gate = ATTNGATE_CLASSES[config.seerattn_gate_type](
+            config.seerattn_gate_block_size, 
+            self.head_dim, 
+            config.seerattn_gate_hidden_size,
+            num_k_head=config.num_key_value_heads, 
+            num_q_head=config.num_attention_heads,
+            force_double=config.seerattn_gate_force_double,
+            use_flash_rope=config.use_flash_rope,
+            kv_group_aware_query=bool(
+                getattr(config, "seerattn_compactattn_kv_group_aware_gate", False)
+            ),
+        )
+
+        self.mask_loss_func = torch.nn.KLDivLoss()
+        self.block_sparse_debug = False
+        self._seer_bs_last_stats = None
+        self.profile_file = os.environ.get("PROFILE_FILE", None)
+
+    def _chunked_gate_cache_store(self, past_key_value: Optional[Cache]):
+        if past_key_value is None:
+            return None
+        store = getattr(past_key_value, "_seer_chunked_gate_k_cache", None)
+        if store is None:
+            store = {}
+            setattr(past_key_value, "_seer_chunked_gate_k_cache", store)
+        return store
+
+    # ---- Storage interface for gate K-block cache (overridden by compactattn) ----
+
+    def _gate_k_get(self, past_key_value: Optional[Cache]) -> Optional[torch.Tensor]:
+        store = self._chunked_gate_cache_store(past_key_value)
+        if store is None:
+            return None
+        return store.get(self.layer_idx, None)
+
+    def _gate_k_append(
+        self, past_key_value: Optional[Cache], k_blocks: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        store = self._chunked_gate_cache_store(past_key_value)
+        if store is None:
+            return None
+        k_blocks = k_blocks.detach()
+        if not k_blocks.is_contiguous():
+            k_blocks = k_blocks.contiguous()
+        prev = store.get(self.layer_idx, None)
+        full = k_blocks if prev is None else torch.cat((prev, k_blocks), dim=1).contiguous()
+        store[self.layer_idx] = full
+        return full
+
+    def _should_use_chunked_gate_cache(
+        self,
+        attention_mask: Optional[torch.Tensor],
+    ) -> bool:
+        if not bool(getattr(self.config, "seerattn_use_chunked_gate_cache", True)):
+            return False
+        if attention_mask is None or attention_mask.dim() != 2:
+            return True
+        if attention_mask.shape[0] > 1:
+            return False
+        return True
+
+    def _can_use_chunked_gate_cache(
+        self,
+        key_states_nope: torch.Tensor,
+        past_key_value: Optional[Cache],
+        cache_position: Optional[torch.LongTensor],
+        block_position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> bool:
+        # With device_map sharding, later layers may receive block_position_embeddings=None
+        # even though the direct gate path still runs correctly without them. The cache path
+        # should follow the same rule and simply skip block rotary when embeddings are absent.
+        del block_position_embeddings
+        if cache_position is not None:
+            chunk_start = int(cache_position[0].item())
+        elif past_key_value is not None:
+            try:
+                chunk_start = int(past_key_value.get_seq_length())
+            except Exception:
+                chunk_start = -1
+        else:
+            return False
+        block_size = int(self.config.seerattn_gate_block_size)
+        if block_size <= 0:
+            return False
+        q_len = int(key_states_nope.shape[1])
+        if (chunk_start % block_size) != 0:
+            return False
+        if q_len < block_size:
+            return False
+        return True
+
+    def _build_chunked_gate_blocks(
+        self,
+        query_states_nope: torch.Tensor,
+        key_states_nope: torch.Tensor,
+        block_position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        q_blocks = self.attn_gate.compress_query_blocks(query_states_nope)
+        k_blocks = self.attn_gate.compress_key_blocks(key_states_nope)
+        q_blocks, k_blocks = self.attn_gate.apply_block_position_embeddings(
+            q=q_blocks,
+            k=k_blocks,
+            position_embeddings=block_position_embeddings,
+        )
+        return q_blocks, k_blocks
+
+    def _reject_unsupported_batch_metadata(
+        self,
+        *,
+        seer_batch_kv_lens: Optional[torch.Tensor],
+        seer_batch_query_lens: Optional[torch.Tensor],
+        seer_batch_query_start: Optional[torch.Tensor],
+    ) -> None:
+        _raise_unsupported_seer_batch_metadata(
+            seer_batch_kv_lens=seer_batch_kv_lens,
+            seer_batch_query_lens=seer_batch_query_lens,
+            seer_batch_query_start=seer_batch_query_start,
+            context=type(self).__name__,
+        )
+
+    def _append_chunked_gate_key_cache(
+        self,
+        key_states_nope: torch.Tensor,
+        past_key_value: Optional[Cache],
+        block_position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        cache_position: Optional[torch.LongTensor],
+    ) -> bool:
+        if not self._can_use_chunked_gate_cache(
+            key_states_nope=key_states_nope,
+            past_key_value=past_key_value,
+            cache_position=cache_position,
+            block_position_embeddings=block_position_embeddings,
+        ):
+            return False
+        store = self._chunked_gate_cache_store(past_key_value)
+        if store is None:
+            return False
+
+        k_blocks = self.attn_gate.compress_key_blocks(key_states_nope)
+        _, k_blocks = self.attn_gate.apply_block_position_embeddings(
+            q=None,
+            k=k_blocks,
+            position_embeddings=block_position_embeddings,
+        )
+        k_blocks = k_blocks.detach().contiguous()
+        prev = store.get(self.layer_idx, None)
+        if prev is None:
+            store[self.layer_idx] = k_blocks
+        else:
+            store[self.layer_idx] = torch.cat((prev, k_blocks), dim=1).contiguous()
+        return True
+
+    def _compute_chunked_gate_from_cache(
+        self,
+        query_states_nope: torch.Tensor,
+        key_states_nope: torch.Tensor,
+        past_key_value: Optional[Cache],
+        block_attention_mask: Optional[torch.Tensor],
+        block_position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        cache_position: Optional[torch.LongTensor],
+        use_softmax: bool,
+    ) -> Optional[torch.Tensor]:
+        if block_attention_mask is None:
+            return None
+        if not self._can_use_chunked_gate_cache(
+            key_states_nope=key_states_nope,
+            past_key_value=past_key_value,
+            cache_position=cache_position,
+            block_position_embeddings=block_position_embeddings,
+        ):
+            return None
+        prev_k_blocks = self._gate_k_get(past_key_value)
+        if prev_k_blocks is None:
+            return None
+
+        q_blocks, current_k_blocks = self._build_chunked_gate_blocks(
+            query_states_nope=query_states_nope,
+            key_states_nope=key_states_nope,
+            block_position_embeddings=block_position_embeddings,
+        )
+
+        if block_attention_mask.shape[-2] != q_blocks.shape[1]:
+            return None
+        full_k_len = int(prev_k_blocks.shape[1]) + int(current_k_blocks.shape[1])
+        if block_attention_mask.shape[-1] != full_k_len:
+            return None
+
+        full_k_blocks = self._gate_k_append(past_key_value, current_k_blocks)
+        if full_k_blocks is None:
+            return None
+
+        return self.attn_gate.score_compressed_blocks(
+            q=q_blocks,
+            k=full_k_blocks,
+            attention_mask=block_attention_mask,
+            use_softmax=use_softmax,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        block_position_embeddings: Tuple[torch.Tensor, torch.Tensor] = None,
+        block_attention_mask: Optional[torch.Tensor] = None,
+        seer_batch_kv_lens: Optional[torch.LongTensor] = None,
+        seer_batch_query_lens: Optional[torch.LongTensor] = None,
+        seer_batch_query_start: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        collect_stats = bool(self.block_sparse_debug) and not self.training
+        input_shape = hidden_states.shape[:-1]
+        q_len = hidden_states.shape[1]
+        self._reject_unsupported_batch_metadata(
+            seer_batch_kv_lens=seer_batch_kv_lens,
+            seer_batch_query_lens=seer_batch_query_lens,
+            seer_batch_query_start=seer_batch_query_start,
+        )
+        (query_states, key_states, value_states), qkv_proj_ms = _cuda_elapsed_ms(
+            lambda: (self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)),
+            collect_stats,
+        )
+
+        query_states = rearrange(query_states, '... (h d) -> ... h d', d=self.head_dim)
+        key_states = rearrange(key_states, '... (h d) -> ... h d', d=self.head_dim)
+        value_states = rearrange(value_states, '... (h d) -> ... h d', d=self.head_dim)
+
+        cos, sin = position_embeddings
+        use_flash_rope = bool(self.config.use_flash_rope) and cos.dim() == 2
+        if use_flash_rope:
+            query_states_nope = query_states.clone()
+            key_states_nope = key_states.clone()
+        else:
+            query_states_nope = query_states
+            key_states_nope = key_states
+
+        if use_flash_rope:
+            query_states = apply_rotary_emb_func(query_states, cos, sin, False, True, cu_seqlens=None, max_seqlen=q_len)
+            key_states = apply_rotary_emb_func(key_states, cos, sin, False, True, cu_seqlens=None, max_seqlen=q_len)
+        else:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, unsqueeze_dim=2)
+
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states.flatten(-2, -1), value_states.flatten(-2, -1), self.layer_idx, cache_kwargs)
+            key_states = rearrange(key_states, '... (h d) -> ... h d', d=self.head_dim)
+            value_states = rearrange(value_states, '... (h d) -> ... h d', d=self.head_dim)
+
+        chunked_prefill = (not self.training) and (q_len > 1) and (key_states.shape[1] > q_len)
+        use_chunked_gate_cache = self._should_use_chunked_gate_cache(attention_mask)
+        force_dense_prefill = (
+            (not self.training)
+            and (q_len > 1)
+            and bool(getattr(self.config, "seerattn_chunked_prefill_force_dense", False))
+        )
+
+        _gate_start = torch.cuda.Event(enable_timing=True) if collect_stats else None
+        _gate_end = torch.cuda.Event(enable_timing=True) if collect_stats else None
+        if collect_stats:
+            _gate_start.record()
+
+        if force_dense_prefill:
+            attn_gate_output = None
+            if use_chunked_gate_cache:
+                self._append_chunked_gate_key_cache(
+                    key_states_nope=key_states_nope,
+                    past_key_value=past_key_value,
+                    block_position_embeddings=block_position_embeddings,
+                    cache_position=cache_position,
+                )
+        elif chunked_prefill:
+            attn_gate_output = None
+            if use_chunked_gate_cache:
+                attn_gate_output = self._compute_chunked_gate_from_cache(
+                    query_states_nope=query_states_nope,
+                    key_states_nope=key_states_nope,
+                    past_key_value=past_key_value,
+                    block_attention_mask=block_attention_mask,
+                    block_position_embeddings=block_position_embeddings,
+                    cache_position=cache_position,
+                    use_softmax=self.config.seerattn_sparsity_method == "threshold",
+                )
+            if attn_gate_output is None:
+                attn_gate_output = self.attn_gate(
+                    query_states,
+                    key_states,
+                    block_attention_mask,
+                    None,
+                    use_softmax=self.config.seerattn_sparsity_method == "threshold",
+                )
+                if use_chunked_gate_cache:
+                    self._append_chunked_gate_key_cache(
+                        key_states_nope=key_states_nope,
+                        past_key_value=past_key_value,
+                        block_position_embeddings=block_position_embeddings,
+                        cache_position=cache_position,
+                    )
+        else:
+            if q_len == 1:
+                attn_gate_output = None  # decode: gate irrelevant, attention is always dense
+            else:
+                attn_gate_output = self.attn_gate(
+                    query_states_nope,
+                    key_states_nope,
+                    block_attention_mask,
+                    block_position_embeddings,
+                    use_softmax=not self.training and self.config.seerattn_sparsity_method == "threshold",
+                )
+            if q_len > 1 and use_chunked_gate_cache:
+                self._append_chunked_gate_key_cache(
+                    key_states_nope=key_states_nope,
+                    past_key_value=past_key_value,
+                    block_position_embeddings=block_position_embeddings,
+                    cache_position=cache_position,
+                )
+
+        if collect_stats:
+            _gate_end.record()
+            _gate_end.synchronize()
+            gate_ms = float(_gate_start.elapsed_time(_gate_end))
+        else:
+            gate_ms = 0.0
+
+        if self.training:
+            # get the block (pooled) mask ground truth
+            attn_output, ground_truth_mask = attention_distill_forward(
+                query_states,
+                key_states,
+                value_states,
+                softmax_scale=self.scaling,
+                block_size=self.config.seerattn_gate_block_size,
+                num_key_value_groups=self.num_key_value_groups,
+            )
+            sparse_attn_ms = 0.0
+        else: ## inference
+            if force_dense_prefill or q_len == 1:
+                attn_output, _ = dense_prefill_full_kv(
+                    query_states=query_states,
+                    key_states=key_states,
+                    value_states=value_states,
+                    attention_mask=attention_mask,
+                    softmax_scale=self.scaling,
+                    num_key_value_groups=self.num_key_value_groups,
+                    fallback_used=0.0,
+                    measure_timing=False,
+                    attn_module=self,
+                )
+                sparse_attn_ms = 0.0
+            else:
+                attn_output, sparse_attn_ms = _cuda_elapsed_ms(
+                    lambda: sparse_flash_attention_forward(
+                        query_states,
+                        key_states,
+                        value_states,
+                        attention_mask,
+                        query_length=q_len,
+                        softmax_scale=self.scaling,
+                        attn_gate_score=attn_gate_output,
+                        sparsity_method=self.config.seerattn_sparsity_method,
+                        threshold=self.config.seerattn_threshold,
+                        nz_ratio=self.config.seerattn_nz_ratio,
+                        last_block_dense=self.config.seerattn_last_block_dense,
+                        block_size=self.config.seerattn_gate_block_size,
+                        num_key_value_groups=self.num_key_value_groups,
+                        profile_file=self.profile_file,
+                        block_attention_mask=block_attention_mask,
+                    ),
+                    collect_stats,
+                )
+
+
+        
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output, o_proj_ms = _cuda_elapsed_ms(lambda: self.o_proj(attn_output), collect_stats)
+
+        if collect_stats:
+            self._seer_bs_last_stats = {
+                "qkv_proj_ms": float(qkv_proj_ms),
+                "gate_ms": float(gate_ms),
+                "sparse_attn_ms": float(sparse_attn_ms),
+                "o_proj_ms": float(o_proj_ms),
+            }
+        else:
+            self._seer_bs_last_stats = None
+
+        if self.training:
+            # remove the first quarter of the data for training stability
+            ground_truth_mask = ground_truth_mask[:, :, ground_truth_mask.shape[2]//4:].to(torch.float32)
+            attn_gate_output = attn_gate_output[:, :, attn_gate_output.shape[2]//4:].to(torch.float32)
+            attn_gate_output = F.log_softmax(attn_gate_output, dim=-1)
+            mask_loss = self.mask_loss_func(attn_gate_output, ground_truth_mask)
+        else:
+            mask_loss = 0.0
+            attn_gate_output = None
+            ground_truth_mask = None
+
+        # In SeerAttention, output_attentions also means output attn_gate_output and ground_truth_mask
+        if not kwargs.get("output_attentions", False):
+            attn_gate_output = None
+            ground_truth_mask = None
+        return attn_output, mask_loss, None, attn_gate_output, ground_truth_mask
+
+
+class SeerAttnLlamaDecoderLayer(nn.Module):
+    def __init__(self, config: SeerAttnLlamaConfig, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = LlamaSeerAttention(config=config, layer_idx=layer_idx)
+        self.fused_norm = config.fused_norm
+        self.mlp = LlamaMLP(config)
+        if self.fused_norm:
+            self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        block_position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        block_attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        residual = hidden_states
+
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states, seerattn_mask_loss, self_attn_weights, mask_gate_prediction, mask_ground_truth = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            block_position_embeddings=block_position_embeddings,
+            block_attention_mask=block_attention_mask,
+            **kwargs,
+        )
+        if self.fused_norm:
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual, True)
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+        
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states, seerattn_mask_loss)
+        if output_attentions:
+            outputs += (self_attn_weights, mask_gate_prediction, mask_ground_truth)
+
+        return outputs
+
+class SeerAttnLlamaPreTrainedModel(PreTrainedModel):
+    config_class = SeerAttnLlamaConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["SeerAttnLlamaDecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+    _supports_flash_attn_2 = True
+    _supports_sdpa = True
+    _supports_cache_class = True
+    _supports_quantized_cache = True
+    _supports_static_cache = True
+
+    def _init_weights(self, module):
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        
+        elif isinstance(module, MultiHeadLinear):
+            module.weight.data.normal_(mean=0.0, std=std)
+
+
+class SeerAttnLlamaModel(SeerAttnLlamaPreTrainedModel):
+    """
+    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`SeerAttnLlamaDecoderLayer`]
+
+    Args:
+        config: SeerAttnLlamaConfig
+    """
+
+    def __init__(self, config: SeerAttnLlamaConfig):
+        super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList(
+            [SeerAttnLlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        
+        #Added for seerattn, block rotary embedding
+        block_config = copy.deepcopy(config)
+        block_config.hidden_size = config.seerattn_gate_hidden_size * config.num_attention_heads
+        self.block_rotary_emb = LlamaRotaryEmbedding(config=block_config)
+       
+        self.gradient_checkpointing = False
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        seer_batch_kv_lens: Optional[torch.LongTensor] = None,
+        seer_batch_query_lens: Optional[torch.LongTensor] = None,
+        seer_batch_query_start: Optional[torch.LongTensor] = None,
+    ) -> Union[Tuple, BaseModelOutputWithPastAndSeer]:
+        _raise_unsupported_seer_batch_metadata(
+            seer_batch_kv_lens=seer_batch_kv_lens,
+            seer_batch_query_lens=seer_batch_query_lens,
+            seer_batch_query_start=seer_batch_query_start,
+            context=type(self).__name__,
+        )
+
+        if attention_mask is not None:
+            if not (attention_mask == 0).any().item():
+                input_length = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
+                # Keep full (all-one) mask when chunked prefill is active (kv_len > q_len).
+                if attention_mask.shape[-1] == input_length:
+                    attention_mask = None
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if self.gradient_checkpointing and self.training and use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+            )
+            use_cache = False
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if use_cache and past_key_values is None:
+            try:
+                past_key_values = DynamicCache(config=self.config)
+            except TypeError:
+                past_key_values = DynamicCache()
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
+        if position_ids is None:
+            position_ids = _build_position_ids_from_attention_mask(
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                query_length=inputs_embeds.shape[1],
+            )
+
+        block_attention_mask = self._seerattn_update_causal_mask(
+            attention_mask,
+            inputs_embeds,
+            cache_position,
+        )
+        
+        hidden_states = inputs_embeds
+
+        # create position embeddings to be shared across the decoder layers
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        
+        #Added for seerattn
+        block_position_ids = position_ids[:, 0::self.config.seerattn_gate_block_size]
+        block_position_embeddings = self.block_rotary_emb(hidden_states, block_position_ids) # downsampled position embeddings
+
+
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        all_mask_gate_predictions = () if output_attentions else None
+        all_mask_ground_truths = () if output_attentions else None
+
+        # added for seerattn
+        total_mask_loss = 0.0
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    decoder_layer.__call__,
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
+                    past_key_values,
+                    output_attentions,
+                    use_cache,
+                    cache_position,
+                    position_embeddings,
+                    block_position_embeddings,
+                    block_attention_mask,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    block_position_embeddings=block_position_embeddings,
+                    block_attention_mask=block_attention_mask,
+                )
+
+            hidden_states = layer_outputs[0]
+            
+            mask_loss = layer_outputs[1]
+            total_mask_loss += mask_loss
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[2],)
+                all_mask_gate_predictions += (layer_outputs[3],)
+                all_mask_ground_truths += (layer_outputs[4],)
+
+        hidden_states = self.norm(hidden_states)
+
+        # add hidden states from the last decoder layer
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        output = BaseModelOutputWithPastAndSeer(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+            mask_gate_predictions=all_mask_gate_predictions,
+            mask_ground_truths=all_mask_ground_truths,
+            mask_loss=total_mask_loss,
+        )
+        return output if return_dict else output.to_tuple()
+
+    def _seerattn_update_causal_mask(
+        self,
+        attention_mask: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        cache_position: Optional[torch.LongTensor] = None,
+    ):
+
+        batch_size, query_len = inputs_embeds.shape[:2]
+        if query_len == 1:
+            return None
+
+        block_size = self.config.seerattn_gate_block_size
+        device = inputs_embeds.device
+        if attention_mask is None:
+            if cache_position is not None:
+                kv_len = int(cache_position[-1].item()) + 1
+            else:
+                kv_len = query_len
+            attention_mask = torch.ones((batch_size, kv_len), dtype=torch.bool, device=device)
+        else:
+            attention_mask = attention_mask.to(torch.bool)
+            kv_len = attention_mask.shape[-1]
+
+        query_mask = attention_mask[:, -query_len:]
+
+        query_valid_blocks = F.max_pool1d(
+            query_mask.unsqueeze(1).to(torch.float32),
+            kernel_size=block_size,
+            stride=block_size,
+            ceil_mode=True,
+        ).squeeze(1).to(torch.bool)
+        key_valid_blocks = F.max_pool1d(
+            attention_mask.unsqueeze(1).to(torch.float32),
+            kernel_size=block_size,
+            stride=block_size,
+            ceil_mode=True,
+        ).squeeze(1).to(torch.bool)
+
+        q_blocks = query_valid_blocks.shape[-1]
+        k_blocks = key_valid_blocks.shape[-1]
+
+        valid_q_lens = query_mask.sum(dim=-1, dtype=torch.int64)
+        valid_k_lens = attention_mask.sum(dim=-1, dtype=torch.int64)
+        past_lens = (valid_k_lens - valid_q_lens).clamp(min=0)
+
+        q_block_end = (torch.arange(q_blocks, device=device, dtype=torch.int64) + 1) * block_size - 1
+        q_block_end = q_block_end.unsqueeze(0).expand(batch_size, -1)
+        q_block_end = torch.minimum(q_block_end, (valid_q_lens.unsqueeze(1) - 1).clamp(min=0))
+        q_block_end = q_block_end + past_lens.unsqueeze(1)
+
+        k_block_idx = torch.arange(k_blocks, device=device, dtype=torch.int64).view(1, 1, -1)
+        causal_mask = k_block_idx <= torch.div(q_block_end.unsqueeze(-1), block_size, rounding_mode='floor')
+
+        gate_mask = causal_mask
+        gate_mask = gate_mask & query_valid_blocks.unsqueeze(-1)
+        gate_mask = gate_mask & key_valid_blocks.unsqueeze(1)
+        return gate_mask.unsqueeze(1)
+
+
+
+class SeerAttnLlamaForCausalLM(SeerAttnLlamaPreTrainedModel, GenerationMixin):
+    _tied_weights_keys = ["lm_head.weight"]
+    _tp_plan = SEER_LLAMA_CAUSALLM_TP_PLAN
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = SeerAttnLlamaModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+
+    #@add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
+    #@replace_return_docstrings(output_type=CausalLMOutputWithPastAndSeer, config_class=_CONFIG_FOR_DOC)
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 1,
+        **kwargs,
+    ) -> Union[Tuple, CausalLMOutputWithPastAndSeer]:
+        r"""
+        Args:
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+            logits_to_keep (`int` or `torch.Tensor`, *optional*):
+                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
+                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
+                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
+                If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
+                This is useful when using packed tensor format (single dimension for batch and sequence length).
+                hacky change: default to 1
+
+        Returns:
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoTokenizer, SeerAttnLlamaForCausalLM
+
+        >>> model = SeerAttnLlamaForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
+        >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+
+        >>> prompt = "Hey, are you conscious? Can you talk to me?"
+        >>> inputs = tokenizer(prompt, return_tensors="pt")
+
+        >>> # Generate
+        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
+        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+        ```"""
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = outputs[0]
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        loss = None
+        if not self.training and labels is not None: ## current self-distillation training does not require loss computation, re-enable if needed
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='sum')
+            valid_seq_len = input_ids.shape[-1] - 1
+            valid_seq_len_slide_win = torch.sum(labels[:, 1:] >= 0).item()
+            loss = 0.0
+            for start_idx in range(0, valid_seq_len, 16384):
+                end_idx = min(start_idx + 16384, valid_seq_len)
+                shift_logits = self.lm_head(hidden_states[..., start_idx:end_idx, :]).float()
+                shift_labels = labels[..., start_idx + 1:end_idx + 1].contiguous()
+                shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                shift_labels = shift_labels.view(-1)
+                shift_labels = shift_labels.to(shift_logits.device)
+                loss += loss_fct(shift_logits, shift_labels)
+            loss /= valid_seq_len_slide_win  
+        #print("loss:", loss)
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPastAndSeer(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            mask_gate_predictions=outputs.mask_gate_predictions,
+            mask_ground_truths=outputs.mask_ground_truths,
+            mask_loss=outputs.mask_loss,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        position_ids=None,
+        use_cache=True,
+        **kwargs,
+    ):
+        # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens
+        # Exception 1: when passing input_embeds, input_ids may be missing entries
+        # Exception 2: some generation methods do special slicing of input_ids, so we don't need to do it here
+        if past_key_values is not None:
+            if inputs_embeds is not None:  # Exception 1
+                input_ids = input_ids[:, -cache_position.shape[0] :]
+            elif input_ids.shape[1] != cache_position.shape[0]:  # Default case (the "else", a no op, is Exception 2)
+                input_ids = input_ids[:, cache_position]
+
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and cache_position[0] == 0:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids.contiguous()}  # `contiguous()` needed for compilation use cases
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, load_gate=True, *model_args, **kwargs):
+        # Call the original method first
+        if load_gate:
+            config = SeerAttnLlamaConfig.from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+            base_model = getattr(config, "base_model", pretrained_model_name_or_path)
+            for key in list(kwargs.keys()):
+                if hasattr(config, key) and key != "torch_dtype":
+                    setattr(config, key, kwargs.pop(key))
+            model = super().from_pretrained(base_model, config=config, *model_args, **kwargs)
+
+            if os.path.exists(pretrained_model_name_or_path):
+                gate_weights = torch.load(os.path.join(pretrained_model_name_or_path, "attn_gate_weights.pth"))
+            else:
+                try: 
+                    gate_weights = torch.load(
+                        hf_hub_download(repo_id=pretrained_model_name_or_path, filename="attn_gate_weights.pth")
+                    )
+                except:
+                    raise ValueError("Could not load the attention gate weights.")
+                    
+            model.load_state_dict(gate_weights, strict=False)
+            print("Attention gate weights loaded successfully.")
+        else:
+            model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+    
+        return model

@@ -1,0 +1,26 @@
+# Working reference env: `compactattn`
+# Install PyTorch separately to match your CUDA runtime.
+# Current working env uses: torch==2.11.0+cu128
+#
+# Install flash-attn after torch.
+# Current working env uses: flash-attn==2.8.3
+
+transformers==4.54.1
+accelerate==1.13.0
+deepspeed==0.16.3
+datasets==4.7.0
+tqdm==4.67.3
+numpy==2.4.3
+scipy==1.17.1
+matplotlib==3.10.8
+pytest==9.0.2
+huggingface-hub==0.36.2
+safetensors==0.7.0
+sentencepiece==0.2.1
+protobuf==7.34.0
+triton==3.6.0
+einops==0.8.2
+PyYAML==6.0.3
+nltk==3.9.3
+wonderwords==3.0.1
+tenacity==9.1.4
