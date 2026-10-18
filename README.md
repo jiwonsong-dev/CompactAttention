@@ -1,4 +1,4 @@
-# CompactAttention: Accelerating Chunked Prefill with Block-Union KV Selection
+# [NeurIPS 2026 Spotlight] CompactAttention: Accelerating Chunked Prefill with Block-Union KV Selection
 
 Official implementation of the paper **"CompactAttention: Accelerating Chunked Prefill with Block-Union KV Selection"**
 
