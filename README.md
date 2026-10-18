@@ -31,8 +31,8 @@ Official implementation of the paper **"CompactAttention: Accelerating Chunked P
 - **Selector-Agnostic**
   Plugs in on top of existing selectors — both training-free (FlashPrefill-style) and learned (SeerAttention-style AttnGate) families are supported.
 
-- **Up to 2.72× Attention Speedup**
-  On LLaMA-3.1-8B-Instruct at 128K context, matches dense-attention accuracy on RULER while delivering up to **2.72×** attention speedup.
+- **Up to 2.79× Attention Speedup**
+  On LLaMA-3.1-8B-Instruct at 128K context, matches dense-attention accuracy on RULER while delivering up to **2.79×** attention speedup.
 
 ## Key Results
 
